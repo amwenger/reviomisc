@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+
+import pysam
+import heapq
+import collections
+import argparse
+import signal
+import array
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+parser = argparse.ArgumentParser(description="Add HiFi read tags that summarize subread-to-HiFi alignment")
+parser.add_argument("hifireads_bam", help="Input HiFi reads")
+parser.add_argument("actc_bam", help="Subread to HiFi read alignments from actc")
+parser.add_argument("out_bam", help="Output HiFi reads")
+
+def makeRevcomp():
+    """Closure for a basepair reverse complement function"""
+    rc = { "A": "T", "C": "G", "G": "C", "T": "A" }
+
+    return lambda seq: "".join([rc.get(b,"N") for b in reversed(seq.upper())])
+revcomp = makeRevcomp()
+
+
+# Enum for CIGAR operations (pysam convention)
+MATCH = 0
+INS = 1
+DEL = 2
+REF_SKIP = 3
+SOFT_CLIP = 4
+HARD_CLIP = 5
+PAD = 6
+EQUAL = 7
+DIFF = 8
+
+# Groups of related CIGAR operations
+QUERYOPS = (MATCH, EQUAL, DIFF, INS) # operations that include query bases
+REFOPS = (MATCH, EQUAL, DIFF, DEL)   # operations that include reference bases
+CLIPPINGOPS = (HARD_CLIP, SOFT_CLIP) # operations that clip query bases
+
+
+def rle(l):
+    """Run-length encode a list of integers as a series of <value>,<run_length>"""
+    if len(l) == 0:
+        return l
+
+    # Add first item
+    result = [l[0], 1]
+    ix = 0 # ix points to most recent value
+
+    for item in l[1:]:
+        if item == result[ix]:
+            result[ix+1] += 1
+        else:
+            result.append(item)
+            result.append(1)
+            ix += 2
+
+    return result
+
+
+def addrichhifitags(hifiread, alignments):
+    """Add rich HiFi tags to `hifiread` that summarize the alignments
+    of subreads to HiFi reads."""
+
+    # If hifiread is from a single-strand, then only consider alignments from that strand.
+    if hifiread.qname.endswith("/rev") or hifiread.qname.endswith("/fwd"):
+        alignments = [a for a in alignments if not a.is_reverse]
+
+    # `sa`: calculate the number of subread alignment that span each HiFi read position
+    alignment_endpoints = []
+    for al in alignments:
+        alignment_endpoints.append((al.reference_start, +1))
+        alignment_endpoints.append((al.reference_end, -1))
+    subread_depth = 0
+    span_endpoints = dict()
+    for pos,change in sorted(alignment_endpoints):
+        subread_depth += change
+        span_endpoints[pos] = subread_depth
+    if 0 not in span_endpoints:
+        span_endpoints[0] = 0
+    span_endpoints = list(sorted(span_endpoints.items()))
+    span_endpoints.append((len(hifiread.query_sequence), 0))
+    span_coverage = []
+    MAX_SPAN_LEN = 65535 # fit value into 16 bits
+    for ix in range(len(span_endpoints)-1):
+        span_start, cov = span_endpoints[ix]
+        span_end, x = span_endpoints[ix+1]
+        span_len = span_end - span_start
+        while span_len > 0:
+            cur_span_len = min(span_len, MAX_SPAN_LEN)
+            span_coverage.append(cur_span_len)
+            span_coverage.append(cov)
+            span_len -= cur_span_len
+    hifiread.set_tag("sa", array.array('H', [int(x) for x in span_coverage]))
+
+
+
+    # `sm`: count the number of subreads that align as a match to each HiFi read position
+    matches_by_pos = len(hifiread.query_sequence) * [0]
+    mismatches_by_pos = len(hifiread.query_sequence) * [0]
+    MAX_SM_SX = 255 # fit value into 8 bits
+    for al in alignments:
+        rpos = al.reference_start
+        qseq = al.query_alignment_sequence
+        for op, oplen in al.cigartuples:
+            assert op != MATCH, """Alignment must use =/X not M"""
+            if op in REFOPS:
+                for i in range(oplen):
+                    if op == EQUAL:
+                        matches_by_pos[rpos] += 1
+                    elif op == DIFF:
+                        mismatches_by_pos[rpos] += 1
+                    rpos += 1
+    hifiread.set_tag("sm", array.array('B', [min(v, MAX_SM_SX) for v in matches_by_pos]))
+    hifiread.set_tag("sx", array.array('B', [min(v, MAX_SM_SX) for v in mismatches_by_pos]))
+
+
+def main():
+    args = parser.parse_args()
+
+    hifireads_bam = pysam.AlignmentFile(args.hifireads_bam, check_sq=False)
+    out_bam = pysam.AlignmentFile(args.out_bam, mode="wb", template=hifireads_bam)
+    hifi_name_to_read = dict()
+    for b in hifireads_bam:
+        hifi_name_to_read[b.qname] = b
+    hifireads_bam.close()
+
+
+    actc_bam = pysam.AlignmentFile(args.actc_bam, check_sq=False)
+    cur_hifi_name = None
+    cur_alignments = list()
+    for b in actc_bam:
+        if b.reference_name != cur_hifi_name:
+            if cur_hifi_name is not None:
+                addrichhifitags(hifi_name_to_read[cur_hifi_name], cur_alignments)
+                out_bam.write(hifi_name_to_read[cur_hifi_name])
+            cur_hifi_name = b.reference_name
+            cur_alignments = []
+        cur_alignments.append(b)
+    if cur_hifi_name is not None:
+        addrichhifitags(hifi_name_to_read[cur_hifi_name], cur_alignments)
+        out_bam.write(hifi_name_to_read[cur_hifi_name])
+
+    actc_bam.close()
+    out_bam.close()
+
+
+if __name__ == "__main__":
+    main()
