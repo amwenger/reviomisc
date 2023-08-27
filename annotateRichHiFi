@@ -134,11 +134,15 @@ def main():
     pysam.set_verbosity(s)
     cur_hifi_name = None
     cur_alignments = list()
+    prev_references = set()
     for b in actc_bam:
         if b.reference_name != cur_hifi_name:
             if cur_hifi_name is not None:
                 addrichhifitags(hifi_name_to_read[cur_hifi_name], cur_alignments)
                 out_bam.write(hifi_name_to_read[cur_hifi_name])
+            assert b.reference_name not in prev_references, """Alignments must be grouped by HiFi read name"""
+            if cur_hifi_name is not None:
+                prev_references.add(cur_hifi_name)
             cur_hifi_name = b.reference_name
             cur_alignments = []
         cur_alignments.append(b)
