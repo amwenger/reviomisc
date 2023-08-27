@@ -119,7 +119,9 @@ def addrichhifitags(hifiread, alignments):
 def main():
     args = parser.parse_args()
 
+    s = pysam.set_verbosity(0)
     hifireads_bam = pysam.AlignmentFile(args.hifireads_bam, check_sq=False)
+    pysam.set_verbosity(s)
     out_bam = pysam.AlignmentFile(args.out_bam, mode="wb", template=hifireads_bam)
     hifi_name_to_read = dict()
     for b in hifireads_bam:
@@ -127,7 +129,9 @@ def main():
     hifireads_bam.close()
 
 
+    s = pysam.set_verbosity(0)
     actc_bam = pysam.AlignmentFile(args.actc_bam, check_sq=False)
+    pysam.set_verbosity(s)
     cur_hifi_name = None
     cur_alignments = list()
     for b in actc_bam:
